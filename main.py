@@ -1,180 +1,250 @@
 import os
 import re
-from typing import List
-from fastapi import FastAPI
+import json
+from typing import List, Dict, Any, Optional
+from functools import lru_cache
+
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="TruthLens AI",
-    description="Evidence-grounded LLM hallucination screening API",
-    version="1.0.0",
+    description="Evidence-grounded LLM hallucination detection with optional NLI",
+    version="2.0.0",
 )
 
+# Model loading is lazy so the service can boot quickly on Render.
+# Set ENABLE_NLI=true to enable a real Hugging Face NLI classifier.
+NLI_MODEL_NAME = os.getenv("NLI_MODEL_NAME", "cross-encoder/nli-deberta-v3-small")
+ENABLE_NLI = os.getenv("ENABLE_NLI", "false").lower() in {"1", "true", "yes"}
+NLI_THRESHOLD = float(os.getenv("NLI_THRESHOLD", "0.65"))
+MAX_CLAIMS = int(os.getenv("MAX_CLAIMS", "40"))
+
+
 def split_claims(text: str) -> List[str]:
+    """Simple sentence-level claim candidates; not full atomic claim extraction."""
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if not text:
         return []
-    return [p.strip() for p in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", text) if p.strip()]
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", text)
+    return [p.strip() for p in parts if p.strip()][:MAX_CLAIMS]
 
-def words(text: str) -> set:
+
+def tokenize(text: str) -> set:
     return set(re.findall(r"\b[\w'-]+\b", text.lower()))
 
-def score_claim(claim: str, evidence: List[str], threshold: float = 0.35):
-    if not evidence:
+
+def lexical_score(claim: str, passage: str) -> float:
+    c = tokenize(claim)
+    p = tokenize(passage)
+    return len(c & p) / max(1, len(c))
+
+
+@lru_cache(maxsize=1)
+def get_nli_pipeline():
+    if not ENABLE_NLI:
+        return None
+    try:
+        from transformers import pipeline
+        return pipeline(
+            "text-classification",
+            model=NLI_MODEL_NAME,
+            tokenizer=NLI_MODEL_NAME,
+            top_k=None,
+            truncation=True,
+        )
+    except Exception as exc:
+        # Do not silently pretend the NLI model is active.
+        raise RuntimeError(f"NLI model could not be loaded: {exc}") from exc
+
+
+def normalize_nli_output(raw) -> Dict[str, float]:
+    """Normalize common Transformers text-classification output shapes."""
+    if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list):
+        raw = raw[0]
+    if isinstance(raw, dict):
+        raw = [raw]
+    scores = {}
+    for item in raw or []:
+        label = str(item.get("label", "")).lower()
+        scores[label] = float(item.get("score", 0.0))
+    return scores
+
+
+def find_score(scores: Dict[str, float], word: str) -> float:
+    return max((v for k, v in scores.items() if word in k), default=0.0)
+
+
+def nli_verdict(claim: str, evidence: str) -> Optional[Dict[str, Any]]:
+    nli = get_nli_pipeline()
+    if nli is None:
+        return None
+    # NLI premise = evidence, hypothesis = claim.
+    raw = nli({"text": evidence, "text_pair": claim})
+    scores = normalize_nli_output(raw)
+    entail = find_score(scores, "entail")
+    contradiction = find_score(scores, "contrad")
+    neutral = find_score(scores, "neutral")
+
+    # Labels vary by model; fail closed if the model doesn't return recognizable labels.
+    if not any(("entail" in k or "contrad" in k or "neutral" in k) for k in scores):
         return {
-            "claim": claim, "verdict": "INSUFFICIENT_EVIDENCE", "confidence": 0.0,
-            "evidence": None,
-            "explanation": "No reference evidence was provided. This does not mean the claim is false.",
-            "method": "no_evidence"
+            "verdict": "NEEDS_REVIEW",
+            "confidence": 0.0,
+            "explanation": "The selected NLI model returned labels this app could not interpret.",
+            "scores": scores,
         }
 
-    claim_words = words(claim)
-    ranked = []
-    for passage in evidence:
-        passage_words = words(passage)
-        overlap = len(claim_words & passage_words) / max(1, len(claim_words))
-        ranked.append((overlap, passage))
-    similarity, best = max(ranked, key=lambda x: x[0])
-
-    # Transparent baseline: exact negation cues + high lexical overlap can flag a possible contradiction.
-    negation = (" not ", " never ", " no ", " isn't ", " doesn't ", " cannot ", " wasn't ", " aren't ")
-    claim_padded, evidence_padded = f" {claim.lower()} ", f" {best.lower()} "
-    claim_neg = any(x in claim_padded for x in negation)
-    evidence_neg = any(x in evidence_padded for x in negation)
-
-    if similarity >= threshold and claim_neg != evidence_neg:
-        verdict = "POSSIBLE_CONTRADICTION"
-        explanation = (
-            "The claim and evidence have substantial word overlap but differ in a negation cue. "
-            "This is only a heuristic flag; review the wording and context."
-        )
-    elif similarity >= threshold:
-        verdict = "POSSIBLY_SUPPORTED"
-        explanation = (
-            "Matching terms were found in the evidence. Lexical overlap does not establish that "
-            "the evidence entails the claim."
-        )
+    if entail >= NLI_THRESHOLD and entail > contradiction:
+        verdict = "SUPPORTED"
+        confidence = entail
+        explanation = "The NLI model estimates that the supplied evidence entails this claim."
+    elif contradiction >= NLI_THRESHOLD and contradiction > entail:
+        verdict = "CONTRADICTED"
+        confidence = contradiction
+        explanation = "The NLI model estimates that the supplied evidence contradicts this claim."
     else:
         verdict = "INSUFFICIENT_EVIDENCE"
-        explanation = (
-            "No sufficiently overlapping evidence was found. This is not proof that the claim is false."
-        )
-
+        confidence = max(neutral, 1.0 - max(entail, contradiction))
+        explanation = "The evidence does not clearly entail or contradict this claim."
     return {
-        "claim": claim,
         "verdict": verdict,
-        "confidence": round(min(similarity, 1.0), 4),
-        "similarity": round(similarity, 4),
-        "evidence": best,
+        "confidence": round(float(confidence), 4),
         "explanation": explanation,
-        "method": "lexical_baseline"
+        "nli_scores": {k: round(v, 4) for k, v in scores.items()},
     }
 
-def analyze(answer: str, evidence: List[str], threshold: float = 0.35):
+
+def analyze(answer: str, evidence: List[str], threshold: float = 0.30) -> Dict[str, Any]:
     claims = split_claims(answer)
-    passages = [re.sub(r"\s+", " ", p).strip() for p in evidence if p.strip()]
-    results = [score_claim(c, passages, threshold) for c in claims]
-    total = len(results)
-    counts = {v: sum(r["verdict"] == v for r in results) for v in [
-        "POSSIBLY_SUPPORTED", "POSSIBLE_CONTRADICTION", "INSUFFICIENT_EVIDENCE"
-    ]}
+    passages = [re.sub(r"\s+", " ", p).strip() for p in evidence if p and p.strip()]
+    output = []
+
+    for claim in claims:
+        if not passages:
+            output.append({
+                "claim": claim,
+                "verdict": "INSUFFICIENT_EVIDENCE",
+                "confidence": 0.0,
+                "evidence": None,
+                "explanation": "No reference evidence was provided. This is not proof that the claim is false.",
+                "method": "no_evidence",
+            })
+            continue
+
+        ranked = sorted(
+            ((lexical_score(claim, passage), passage) for passage in passages),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        best_score, best_passage = ranked[0]
+
+        try:
+            nli = nli_verdict(claim, best_passage)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+        if nli is not None:
+            result = {
+                "claim": claim,
+                **nli,
+                "evidence": best_passage,
+                "retrieval_score": round(best_score, 4),
+                "method": f"lexical_retrieval+nli:{NLI_MODEL_NAME}",
+            }
+        else:
+            # Conservative fallback. It never labels a claim definitely supported/false.
+            if best_score >= threshold:
+                verdict = "POSSIBLY_SUPPORTED"
+                explanation = (
+                    "Relevant terms overlap with this passage, but no NLI model is enabled. "
+                    "Word overlap cannot establish entailment or contradiction."
+                )
+            else:
+                verdict = "INSUFFICIENT_EVIDENCE"
+                explanation = (
+                    "No sufficiently overlapping passage was found. This does not prove the claim is false."
+                )
+            result = {
+                "claim": claim,
+                "verdict": verdict,
+                "confidence": round(best_score, 4),
+                "evidence": best_passage,
+                "retrieval_score": round(best_score, 4),
+                "explanation": explanation,
+                "method": "lexical_baseline",
+            }
+        output.append(result)
+
+    counts = {}
+    for item in output:
+        counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
+
+    total = len(output)
+    evidence_found = sum(bool(item.get("evidence")) for item in output)
     return {
         "summary": {
             "total_claims": total,
-            **{k.lower(): v for k, v in counts.items()},
-            "evidence_coverage": round(sum(bool(r.get("evidence")) for r in results) / total, 4) if total else 0.0,
+            "verdict_counts": counts,
+            "evidence_coverage": round(evidence_found / total, 4) if total else 0.0,
+            "nli_enabled": ENABLE_NLI,
+            "nli_model": NLI_MODEL_NAME if ENABLE_NLI else None,
         },
-        "results": results,
+        "results": output,
         "limitations": [
-            "This Render-ready version uses a lexical baseline, not a trained NLI model.",
-            "Similarity and word overlap are not calibrated probabilities of truth.",
-            "Contradiction flags are heuristic and may be wrong; human review is required.",
-            "Results are only as good as the evidence supplied by the user."
-        ]
+            "NLI estimates whether evidence entails or contradicts a claim; it does not independently establish real-world truth.",
+            "The current retrieval step uses lexical overlap and may miss paraphrases or relevant passages.",
+            "Claims requiring multiple passages, arithmetic, time-sensitive facts, or external knowledge may need specialized verification.",
+            "Confidence values are model scores, not calibrated probabilities unless separately calibrated on a representative benchmark.",
+            "Human review is required for high-impact decisions.",
+        ],
     }
+
 
 class AnalyzeRequest(BaseModel):
     answer: str = Field(..., min_length=1, max_length=30000)
     evidence: List[str] = Field(default_factory=list, max_length=100)
-    similarity_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "truthlens-ai"}
+    return {"status": "ok", "service": "truthlens-ai", "nli_enabled": ENABLE_NLI}
+
 
 @app.post("/analyze")
 def analyze_endpoint(request: AnalyzeRequest):
     return analyze(request.answer, request.evidence, request.similarity_threshold)
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return HTML
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TruthLens AI — Hallucination Screening</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TruthLens AI</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--panel:#131b30;--line:#293653;--text:#edf2ff;--muted:#a7b4ce;--accent:#8b9cff;--green:#77e0b5;--red:#ff9eaa;--yellow:#ffd580}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#172447 0%,var(--bg) 55%);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
-.wrap{max-width:1100px;margin:auto;padding:34px 20px 60px}.brand{display:flex;align-items:center;gap:12px}.logo{width:42px;height:42px;border-radius:13px;background:#29375e;display:grid;place-items:center;font-size:23px}
-h1{font-size:clamp(2rem,5vw,3.2rem);line-height:1.1;margin:28px 0 12px;letter-spacing:-.04em}.grad{color:#aab6ff}.lead{color:var(--muted);max-width:720px}
-.panel{background:rgba(19,27,48,.92);border:1px solid var(--line);border-radius:18px;padding:22px;margin-top:24px;box-shadow:0 20px 50px #0002}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{display:flex;flex-direction:column;gap:8px}label{font-weight:650;font-size:.94rem}
-textarea{width:100%;min-height:190px;resize:vertical;background:#0b1224;border:1px solid #344363;border-radius:12px;color:var(--text);padding:13px;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}textarea:focus{outline:2px solid var(--accent);border-color:transparent}
-small,.muted{color:var(--muted)}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:18px}
-button{border:0;border-radius:11px;padding:12px 18px;font-weight:750;cursor:pointer;background:#9eacff;color:#11182d}button:disabled{opacity:.6;cursor:wait}.secondary{background:#263452;color:var(--text)}
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.metric{border:1px solid var(--line);background:#0e1629;border-radius:13px;padding:15px}.metric strong{display:block;font-size:1.7rem}.metric span{color:var(--muted);font-size:.85rem}
-.result{border:1px solid var(--line);border-radius:13px;padding:16px;margin-top:12px;background:#0e1629}.topline{display:flex;justify-content:space-between;gap:10px;align-items:start}.tag{font-size:.75rem;font-weight:800;padding:4px 8px;border-radius:8px;background:#293653;white-space:nowrap}.supported{color:var(--green)}.contradiction{color:var(--red)}.insufficient{color:var(--yellow)}.evidence{border-left:3px solid #6477d8;padding:8px 12px;margin-top:12px;color:#cbd6f2;background:#131e37;white-space:pre-wrap}
-.notice{font-size:.86rem;color:var(--muted);border-top:1px solid var(--line);padding-top:15px;margin-top:20px}.error{color:var(--red)}.hidden{display:none}
-@media(max-width:720px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.panel{padding:16px}}
-</style>
-</head>
-<body><main class="wrap">
-<div class="brand"><div class="logo">⌕</div><div><strong>TRUTHLENS AI</strong><div class="muted" style="font-size:.78rem">EVIDENCE-GROUNDED AI QUALITY</div></div></div>
-<h1>Can you <span class="grad">trust the answer?</span></h1>
-<p class="lead">Screen LLM responses claim by claim. Provide reference passages, inspect matching evidence, and flag claims that need review.</p>
-<section class="panel">
-<div class="grid">
-<div class="field"><label for="answer">LLM-generated answer</label><textarea id="answer" placeholder="Paste an AI-generated answer here..."></textarea><small>Each sentence is treated as a candidate claim.</small></div>
-<div class="field"><label for="evidence">Reference evidence</label><textarea id="evidence" placeholder="Paste trusted source passages. Put each passage on a separate line..."></textarea><small>Use reliable source text relevant to the answer.</small></div>
-</div>
-<div class="actions"><button id="run">Analyze answer →</button><button class="secondary" id="demo">Load demo</button><span id="status" class="muted" role="status"></span></div>
-</section>
-<section id="output" class="panel hidden" aria-live="polite">
-<h2>Verification report</h2><div id="metrics" class="metrics"></div><div id="results"></div>
-<div class="actions"><button class="secondary" id="download">Download JSON report</button></div>
-<div class="notice" id="limitations"></div>
-</section>
-<p class="notice">TruthLens is a screening aid, not a truth oracle. This deployable starter uses lexical overlap and simple negation heuristics; it does not run a trained NLI model. Unsupported does not mean false. Review all high-impact results.</p>
-</main>
-<script>
-let lastReport=null;
-const $=id=>document.getElementById(id);
-$("demo").onclick=()=>{$("answer").value="Water freezes at 0 degrees Celsius. The Sun does not revolve around Earth."; $("evidence").value="Pure water freezes at 0 degrees Celsius under standard atmospheric pressure.\\nEarth revolves around the Sun.";};
-$("run").onclick=async()=>{
- const answer=$("answer").value.trim();
- const evidence=$("evidence").value.split("\\n").map(x=>x.trim()).filter(Boolean);
- if(!answer){$("status").textContent="Please enter an answer first.";return;}
- $("run").disabled=true;$("status").textContent="Analyzing claims…";
- try{
-  const r=await fetch("/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({answer,evidence})});
-  if(!r.ok)throw new Error((await r.text()).slice(0,250));
-  const data=await r.json();lastReport=data;$("output").classList.remove("hidden");
-  const s=data.summary;
-  const cards=[["Claims",s.total_claims],["Possibly supported",s.possibly_supported],["Possible contradictions",s.possible_contradiction],["Evidence coverage",Math.round(s.evidence_coverage*100)+"%"]];
-  $("metrics").innerHTML=cards.map(([label,val])=>`<div class="metric"><strong>${val}</strong><span>${label}</span></div>`).join("");
-  $("results").innerHTML=data.results.map((x,i)=>{
-   let cls=x.verdict==="POSSIBLY_SUPPORTED"?"supported":x.verdict==="POSSIBLE_CONTRADICTION"?"contradiction":"insufficient";
-   return `<article class="result"><div class="topline"><strong>${i+1}. ${escapeHtml(x.claim)}</strong><span class="tag ${cls}">${x.verdict.replaceAll("_"," ")}</span></div><p>${escapeHtml(x.explanation)}</p><small>Overlap score: ${x.confidence}</small>${x.evidence?`<div class="evidence"><strong>Best matching passage</strong><br>${escapeHtml(x.evidence)}</div>`:""}</article>`;
-  }).join("")||"<p>No claims could be extracted.</p>";
-  $("limitations").innerHTML="<strong>Limitations</strong><ul>"+data.limitations.map(x=>`<li>${escapeHtml(x)}</li>`).join("")+"</ul>";
-  $("status").textContent="Analysis complete.";
- }catch(e){$("status").textContent="Error: "+e.message;}
- finally{$("run").disabled=false;}
-};
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-$("download").onclick=()=>{if(!lastReport)return;const blob=new Blob([JSON.stringify(lastReport,null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="truthlens-report.json";a.click();URL.revokeObjectURL(a.href);};
+:root{color-scheme:dark;--bg:#0a1020;--panel:#121c32;--line:#2a3958;--text:#eff3ff;--muted:#aab7d0;--accent:#9aaaff;--green:#80e0b9;--red:#ff9eac;--yellow:#ffd58a}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#19294d,var(--bg) 60%);color:var(--text);font:16px/1.55 system-ui,sans-serif}.wrap{max-width:1100px;margin:auto;padding:34px 20px 60px}.brand{display:flex;gap:12px;align-items:center}.logo{height:44px;width:44px;border-radius:14px;background:#293b66;display:grid;place-items:center;font-size:24px}h1{font-size:clamp(2rem,5vw,3.3rem);line-height:1.08;letter-spacing:-.04em;margin:28px 0 12px}.grad{color:#a9b6ff}.muted,small{color:var(--muted)}.lead{max-width:750px;color:var(--muted)}.panel{background:#121c32ee;border:1px solid var(--line);border-radius:18px;padding:22px;margin-top:24px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{display:flex;flex-direction:column;gap:8px}label{font-weight:700}textarea{width:100%;min-height:185px;resize:vertical;background:#0b1428;border:1px solid #354666;border-radius:12px;color:var(--text);padding:13px;font:14px/1.6 ui-monospace,monospace}textarea:focus{outline:2px solid var(--accent)}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:18px}button{border:0;border-radius:11px;padding:12px 18px;font-weight:750;cursor:pointer;background:#a6b2ff;color:#10172c}button.secondary{background:#283958;color:var(--text)}button:disabled{opacity:.55}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.metric,.result{border:1px solid var(--line);background:#0d172b;border-radius:13px;padding:15px}.metric strong{display:block;font-size:1.65rem}.metric span{font-size:.84rem;color:var(--muted)}.result{margin-top:12px}.topline{display:flex;justify-content:space-between;gap:12px;align-items:start}.tag{font-size:.72rem;font-weight:850;padding:4px 8px;border-radius:8px;background:#273756}.supported{color:var(--green)}.contradicted,.possible_contradiction{color:var(--red)}.insufficient_evidence,.needs_review,.possibly_supported{color:var(--yellow)}.evidence{margin-top:12px;padding:10px 12px;background:#172442;border-left:3px solid #7f91ee;white-space:pre-wrap}.notice{font-size:.88rem;color:var(--muted);border-top:1px solid var(--line);margin-top:22px;padding-top:15px}.hidden{display:none}.error{color:var(--red)}@media(max-width:720px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.panel{padding:16px}}
+</style></head><body><main class="wrap">
+<div class="brand"><div class="logo">⌕</div><div><strong>TRUTHLENS AI</strong><div class="muted" style="font-size:.78rem">LLM CLAIM VERIFICATION</div></div></div>
+<h1>Check the answer.<br><span class="grad">Inspect the evidence.</span></h1>
+<p class="lead">Analyze AI-generated claims against supplied reference passages. Enable a trained Natural Language Inference model to distinguish support, contradiction, and insufficient evidence.</p>
+<section class="panel"><div class="grid">
+<div class="field"><label for="answer">LLM-generated answer</label><textarea id="answer" placeholder="Paste the response to check..."></textarea><small>Each sentence is treated as a candidate claim.</small></div>
+<div class="field"><label for="evidence">Reference evidence</label><textarea id="evidence" placeholder="Paste trusted passages, one per line..."></textarea><small>Use reliable source text relevant to the answer.</small></div></div>
+<div class="actions"><button id="run">Analyze claims →</button><button id="demo" class="secondary">Load demo</button><span id="status" class="muted" role="status"></span></div></section>
+<section id="output" class="panel hidden" aria-live="polite"><h2>Verification report</h2><div id="metrics" class="metrics"></div><div id="results"></div><div class="actions"><button id="download" class="secondary">Download JSON report</button></div><div id="limitations" class="notice"></div></section>
+<p class="notice">A detector estimates evidence support; it is not a truth oracle. Unsupported claims are not automatically false. Review important results, especially for medical, legal, or financial use.</p>
+</main><script>
+let report=null;const $=id=>document.getElementById(id);
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+$("demo").onclick=()=>{$("answer").value="Water freezes at 0 degrees Celsius. The Sun revolves around Earth."; $("evidence").value="Pure water freezes at 0 degrees Celsius under standard atmospheric pressure.\\nEarth orbits the Sun.";};
+$("run").onclick=async()=>{const answer=$("answer").value.trim(),evidence=$("evidence").value.split("\\n").map(s=>s.trim()).filter(Boolean);if(!answer){$("status").textContent="Enter an answer first.";return;} $("run").disabled=true;$("status").textContent="Analyzing…";try{const r=await fetch("/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({answer,evidence})});const data=await r.json();if(!r.ok)throw new Error(data.detail||"Request failed");report=data;$("output").classList.remove("hidden");const s=data.summary;const entries=[["Claims",s.total_claims],["Supported",s.verdict_counts.SUPPORTED||0],["Contradicted",s.verdict_counts.CONTRADICTED||0],["Insufficient evidence",s.verdict_counts.INSUFFICIENT_EVIDENCE||0]];$("metrics").innerHTML=entries.map(([k,v])=>`<div class="metric"><strong>${v}</strong><span>${k}</span></div>`).join("");$("results").innerHTML=data.results.map((x,i)=>`<article class="result"><div class="topline"><strong>${i+1}. ${esc(x.claim)}</strong><span class="tag ${x.verdict.toLowerCase()}">${esc(x.verdict.replaceAll("_"," "))}</span></div><p>${esc(x.explanation)}</p><small>Score: ${x.confidence} · Method: ${esc(x.method)}</small>${x.evidence?`<div class="evidence"><strong>Evidence</strong><br>${esc(x.evidence)}</div>`:""}</article>`).join("")||"<p>No claims extracted.</p>";$("limitations").innerHTML="<strong>Limitations</strong><ul>"+data.limitations.map(x=>`<li>${esc(x)}</li>`).join("")+"</ul>";$("status").textContent=s.nli_enabled?"Analysis complete · NLI enabled":"Analysis complete · lexical fallback";}catch(e){$("status").textContent="Error: "+e.message;}finally{$("run").disabled=false;}};
+$("download").onclick=()=>{if(!report)return;const a=document.createElement("a"),u=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:"application/json"}));a.href=u;a.download="truthlens-report.json";a.click();URL.revokeObjectURL(u);};
 </script></body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML
