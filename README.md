@@ -133,3 +133,9 @@ A contradicted claim is contradicted by the **supplied evidence**; this is not a
 4. Evaluate on a labeled benchmark; report precision, recall, F1, confusion matrix, false-positive rate, calibration, and latency.
 5. Add persistent analysis history and authentication if needed.
 6. Consider a hosted inference endpoint if Render resource limits prevent local NLI model execution.
+
+<div align="center">
+
+Developed by Lakshya Kansal
+
+</div>
